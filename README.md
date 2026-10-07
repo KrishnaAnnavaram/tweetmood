@@ -9,7 +9,7 @@
 ![Labels](https://img.shields.io/badge/Labels-negative_%7C_positive-1F3864?style=for-the-badge)
 ![Models](https://img.shields.io/badge/Models-lexicon_%7C_TF--IDF_%7C_hybrid_%7C_fine--tune-2E5FD9?style=for-the-badge)
 ![Slang map](https://img.shields.io/badge/Slang_map-79_phrases-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-34_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-29_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -106,7 +106,7 @@ tweetmood gives each of these questions its own component and its own tests.
 | Providers | Hugging Face Transformers for the `hf` embedder and the fine-tuned model. Optional |
 | Offline mode | Synthetic tweets, the normalizer, the lexicon and TF-IDF models, the hybrid models with the `hash` embedder (torch), evaluation, prediction |
 | Safety | One shared split with a fingerprint, selection on validation only, no stop-word removal, normalizer inside every model |
-| Tests | **34** unit tests (`pytest`). In CI without torch, 29 pass and the torch module (5 tests) skips |
+| Tests | **29** unit tests pass in CI (`pytest`). The torch module (5 tests) skips without the `torch` extra. With the `torch` extra, 34 pass |
 
 ```mermaid
 flowchart LR
@@ -442,8 +442,8 @@ tweetmood needs no credentials. Keep any download token out of the repository.
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests (all extras) | **34 passed** | `pytest -q` |
-| Unit tests (CI, dev extra only) | **29 passed, 1 skipped** (the torch module with 5 tests) | `pytest -q` |
+| Unit tests (CI installs only `.[dev]`) | **29 passed, 1 skipped** (the torch module with 5 tests) | `pytest -q` |
+| Unit tests with the `torch` extra | **34 passed** | `pip install -e ".[dev,torch]"`, `pytest -q` |
 | Synthetic split | 4000 tweets → 2661 after de-duplication (1115 copies, 224 conflicting rows). Train 1218, val 174, test 1269 (921 of them from the held-out Gen-Z source) | `tweetmood demo` |
 | Test report (synthetic data) | See the first table | `tweetmood demo --neural` |
 | Normalizer ablation (synthetic data) | See the second table | `tweetmood demo` |
