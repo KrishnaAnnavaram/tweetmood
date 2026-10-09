@@ -69,6 +69,7 @@ This README is the **one location that explains all of tweetmood**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one tweet](#42-the-life-cycle-of-one-tweet)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The normalizer](#5-the-normalizer)
 6. 🟢 [The data and the shared split](#6-the-data-and-the-shared-split)
 7. 🟣 [The models](#7-the-models)
@@ -136,6 +137,57 @@ flowchart LR
 | Settings | `src/tweetmood/config.py` | Settings from environment variables |
 | CLI | `src/tweetmood/cli.py` | The `tweetmood` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>tweetmood command"]
+    CFG["config.py<br/>load_settings"]
+    subgraph DATA["data/"]
+        SYN["synthetic.py<br/>make_tweets"]
+        LOAD["loaders.py<br/>load_many, LOADERS"]
+        SPL["split.py<br/>make_split, load_split"]
+    end
+    subgraph TEXT["text/"]
+        NORM["normalize.py<br/>Normalizer, slice detectors"]
+        MAPS["lexicon.py<br/>EMOTICONS, SLANG, NEGATORS"]
+    end
+    WF["workflow.py<br/>train_models, evaluate_models,<br/>predict, ablate"]
+    EV["evaluate.py<br/>macro_f1, bootstrap, McNemar"]
+    subgraph MODELS["models/"]
+        BASE["base.py<br/>build_model, load_model"]
+        LEX["lexicon.py<br/>LexiconModel"]
+        LIN["linear.py<br/>TfidfModel"]
+        HYB["hybrid.py<br/>HybridModel, torch"]
+        FT["finetune.py<br/>FineTuneModel, torch + hf"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> LOAD
+    CLI --> SPL
+    CLI --> WF
+    CLI --> NORM
+    SPL --> LOAD
+    SPL --> NORM
+    WF --> SPL
+    WF --> BASE
+    WF --> EV
+    WF --> NORM
+    BASE --> LEX
+    BASE --> LIN
+    BASE --> HYB
+    BASE --> FT
+    LEX --> NORM
+    LIN --> NORM
+    HYB --> NORM
+    FT --> NORM
+    LIN --> EV
+    HYB --> EV
+    FT --> EV
+    NORM --> MAPS
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -176,6 +228,19 @@ tweetmood/
 ### 3.1 One shared split
 `prepare` writes `split.csv` one time. Every command reads it and checks its fingerprint. The registry stores the fingerprint, and `evaluate` refuses models from another split.
 
+```mermaid
+flowchart LR
+    PREP["tweetmood prepare"] --> SPLIT[("split.csv +<br/>manifest.json fingerprint")]
+    SPLIT --> LS{"load_split:<br/>fingerprint matches?"}
+    LS -- "no" --> ERR1[/"ValueError"/]
+    LS -- "yes" --> TRAIN["train_models"]
+    TRAIN --> REG[("registry.json<br/>split_fingerprint")]
+    LS -- "yes" --> EVAL{"evaluate_models:<br/>registry fingerprint matches?"}
+    REG --> EVAL
+    EVAL -- "no" --> ERR2[/"ValueError: trained<br/>on another split"/]
+    EVAL -- "yes" --> REP[/"evaluation.json, evaluation.md"/]
+```
+
 ### 3.2 Negations are never removed
 The normalizer has no stop list. It expands `dont` to `do not` and `isn't` to `is not`. For the TF-IDF and lexicon models, it marks up to three words after a negator with `NEG_`.
 
@@ -201,20 +266,60 @@ A hybrid model trains only its head, so it uses a head learning rate of 1e-3, up
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    SRC["corpora or synthetic tweets"] --> LOAD["loaders: binary labels, source"]
+flowchart TD
+    SRC[/"corpora or synthetic tweets"/] --> LOAD["loaders: binary labels, source"]
     LOAD --> DEDUP["de-duplicate on normalized key"]
     DEDUP --> SPLIT["stratified split + holdout sources"]
-    SPLIT --> MAN["split.csv + manifest.json"]
+    SPLIT --> MAN[("split.csv + manifest.json")]
     MAN --> TRAIN["train each model on train"]
     TRAIN --> SEL["select settings on val"]
-    SEL --> REG["registry.json: best model on val"]
+    SEL --> REG[("registry.json: best model on val")]
     REG --> EVAL["evaluate on test: CI, McNemar, slices"]
-    REG --> PRED["predict new tweets"]
+    EVAL --> REP[/"evaluation.json, evaluation.md"/]
+    NEW[/"new tweets"/] --> PRED["predict new tweets"]
+    REG --> PRED
+    PRED --> LAB[/"label, p_positive, model"/]
     MAN --> ABL["ablation of the normalizer"]
+    ABL --> ABT[/"ablation table"/]
+    LAB --> HUMAN{{"HUMAN<br/>a person reviews every decision<br/>that uses the labels"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one tweet
+
+```mermaid
+stateDiagram-v2
+    state "Raw row" as Raw
+    state "Loaded: text, label, source" as Loaded
+    state "Keyed: dedup_key" as Keyed
+    state "Dropped by the loader" as LoadDrop
+    state "Removed by deduplicate" as DedupDrop
+    state "Normalized tokens" as Normalized
+    state "Test prediction and slices" as Scored
+    [*] --> Raw
+    Raw --> LoadDrop: empty_text or label_not_binary
+    Raw --> Loaded: loader keeps a binary label
+    Loaded --> Keyed: dedup_key from the normalized text
+    Keyed --> DedupDrop: empty key, copy of a key, or conflicting labels
+    Keyed --> test: holdout source
+    Keyed --> train: stratified split
+    Keyed --> val: stratified split
+    Keyed --> test: stratified split
+    train --> Normalized: model fit
+    val --> Normalized: settings selection
+    test --> Scored: evaluate_models, after the selection
+    Normalized --> [*]
+    Scored --> [*]
+    LoadDrop --> [*]
+    DedupDrop --> [*]
+    state "New tweet" as NewTweet
+    state "Label and p_positive" as Predicted
+    [*] --> NewTweet: tweetmood predict
+    NewTweet --> Predicted: best model, same normalizer
+    Predicted --> [*]
+```
 
 1. The loader reads the tweet and its label, and adds the source name.
 2. The splitter makes the de-duplication key from the normalized text.
@@ -225,11 +330,87 @@ flowchart TB
 7. At prediction time, the best model normalizes a new tweet with the same steps.
 8. The model returns the label and the probability of `positive`.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Analyst
+    participant CLI as tweetmood CLI
+    participant LD as loaders.py
+    participant SP as split.py
+    participant WF as workflow.py
+    participant M as Model
+    participant FS as data/prepared and models_out
+
+    A->>CLI: tweetmood prepare --source KIND=PATH
+    CLI->>LD: load_many(specs, sample, seed)
+    LD-->>CLI: text, label, source and LoadReport
+    CLI->>SP: make_split(raw, seed, holdout_sources)
+    SP->>SP: validate, deduplicate, id from key, stratified split
+    CLI->>FS: save_split: split.csv, manifest.json
+    A->>CLI: tweetmood train
+    CLI->>FS: load_split, check the fingerprint
+    CLI->>WF: train_models(names)
+    loop each model name
+        WF->>M: build_model, fit(train, val)
+        M-->>WF: val macro-F1
+        WF->>FS: model.save(models_out/name)
+    end
+    WF->>FS: registry.json with the best model on val
+    A->>CLI: tweetmood evaluate
+    CLI->>WF: evaluate_models
+    WF->>FS: load_model for each registry entry
+    WF->>WF: scores, slice_scores, mcnemar vs best
+    WF->>FS: evaluation.json, evaluation.md
+    A->>CLI: tweetmood predict with a tweet
+    CLI->>WF: predict(texts)
+    WF->>M: load the best model, predict_proba
+    WF-->>A: label, p_positive, model
+```
+
 ---
 
 ## 5. The normalizer
 
 **Purpose.** Give every model the same text, with the sentiment signal kept.
+
+The first diagram shows `Normalizer.normalize`. A step with a flag runs only when the flag is on.
+
+```mermaid
+flowchart TD
+    IN[/"Raw tweet"/] --> S1["html.unescape, URL to url,<br/>mention to @user"]
+    S1 --> S2["emoticons: EMOTICONS map,<br/>case still known"]
+    S2 --> S3["slang: W to win, L to loss"]
+    S3 --> S4["emoji: emoji_name,<br/>drop joiners and skin tones"]
+    S4 --> S5["hashtags: split the tag<br/>NoCap to No Cap"]
+    S5 --> S6["Lower-case"]
+    S6 --> S7["NEGATION_FORMS:<br/>dont to do not, always on"]
+    S7 --> S8["elongation: letter runs<br/>to two letters"]
+    S8 --> S9["slang: SLANG pattern,<br/>longest phrase first"]
+    S9 --> S10["Space out punctuation"]
+    S10 --> NS{"negation_scope?"}
+    NS -- "yes" --> MN["mark_negation"]
+    NS -- "no" --> OUT[/"Space-separated tokens"/]
+    MN --> OUT
+```
+
+The second diagram shows `mark_negation`, which runs for each token.
+
+```mermaid
+flowchart TD
+    TOK[/"Next token"/] --> P{"Punctuation only?"}
+    P -- "yes" --> R0["Scope ends: left = 0,<br/>keep the token"]
+    P -- "no" --> NG{"Token in NEGATORS?<br/>not, no, never ..."}
+    NG -- "yes" --> R3["left = 3, keep the token"]
+    NG -- "no" --> L{"left above 0?"}
+    L -- "yes" --> MARK["Write NEG_token,<br/>left = left - 1"]
+    L -- "no" --> KEEP["Keep the token"]
+    R0 --> OUT[/"Marked text"/]
+    R3 --> OUT
+    MARK --> OUT
+    KEEP --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -269,6 +450,48 @@ flowchart TB
 
 **Purpose.** Give all models the same de-duplicated split, with each source visible.
 
+The first diagram shows how `load_many` reads the sources.
+
+```mermaid
+flowchart TD
+    SPEC[/"--source KIND=PATH"/] --> K{"KIND in LOADERS<br/>and PATH given?"}
+    K -- "no" --> ERR[/"ValueError"/]
+    K -- "sentiment140" --> S140["Six columns, latin-1,<br/>0 negative, 4 positive"]
+    K -- "tweeteval" --> TE["train, val, test files pooled,<br/>neutral dropped"]
+    K -- "social" --> SO["Text and Sentiment columns,<br/>only Positive or Negative"]
+    K -- "unified" --> UN["text, label, source columns"]
+    S140 --> FIN["_finish: drop empty_text<br/>and label_not_binary"]
+    TE --> FIN
+    SO --> FIN
+    UN --> FIN
+    FIN --> S14{"sentiment140?"}
+    S14 -- "yes" --> SMP["Drop exact duplicates,<br/>balanced --sample without replacement"]
+    S14 -- "no" --> OUT[/"text, label, source<br/>and a LoadReport"/]
+    SMP --> OUT
+```
+
+The second diagram shows `make_split` and `save_split`.
+
+```mermaid
+flowchart TD
+    IN[/"Loaded rows"/] --> VAL{"validate: text, label,<br/>source columns valid?"}
+    VAL -- "no" --> SE[/"SchemaError"/]
+    VAL -- "yes" --> KEY["dedup_key for each tweet"]
+    KEY --> CON{"Copies of a key<br/>with two labels?"}
+    CON -- "yes" --> DROP["Remove all copies"]
+    CON -- "no" --> ONE["Keep one copy"]
+    ONE --> ID["id = SHA-1 of the key"]
+    ID --> HO{"Holdout source?"}
+    HO -- "yes" --> TEST["test"]
+    HO -- "no" --> STR{"Each label and source<br/>group has 3 or more rows?"}
+    STR -- "yes" --> SPL["train_test_split 70 / 10 / 20,<br/>stratified by label and source"]
+    STR -- "no" --> SPL2["Same split,<br/>stratified by label only"]
+    SPL --> SAVE["save_split"]
+    SPL2 --> SAVE
+    TEST --> SAVE
+    SAVE --> OUT[("split.csv and manifest.json:<br/>fingerprint, rows, labels, sources")]
+```
+
 | Input | Output |
 |---|---|
 | `KIND=PATH` sources | `split.csv` with `id, text, label, source, split` and `manifest.json` |
@@ -294,6 +517,68 @@ flowchart TB
 ## 7. The models
 
 **Purpose.** Compare simple and complex models under the same conditions.
+
+The first diagram shows the `lexicon` model.
+
+```mermaid
+flowchart LR
+    T[/"Tweet"/] --> N["Normalizer with<br/>negation_scope on"]
+    N --> TOK{"Token starts<br/>with NEG_?"}
+    TOK -- "no" --> ADD["Add POLARITY of the token,<br/>81 entries"]
+    TOK -- "yes" --> FLIP["Subtract 0.8 × POLARITY<br/>of the word"]
+    ADD --> SUM["Sum = score"]
+    FLIP --> SUM
+    SUM --> TH["score - threshold,<br/>threshold with the best train accuracy"]
+    TH --> P[/"p_positive = sigmoid(1.5 × value)"/]
+```
+
+The second diagram shows the TF-IDF models.
+
+```mermaid
+flowchart TD
+    TR[/"train texts and labels"/] --> LOOP["For each strength in STRENGTHS:<br/>C or alpha"]
+    LOOP --> PIPE["Pipeline: NormalizeText,<br/>TfidfVectorizer 1-2 grams, classifier"]
+    PIPE --> CLF{"Model name"}
+    CLF -- "tfidf-logreg" --> LR["LogisticRegression"]
+    CLF -- "tfidf-svm" --> SVM["CalibratedClassifierCV<br/>of LinearSVC, cv 3"]
+    CLF -- "tfidf-nb" --> NB["ComplementNB"]
+    LR --> FIT["fit on train, sparse matrix"]
+    SVM --> FIT
+    NB --> FIT
+    FIT --> VS["macro-F1 on val"]
+    VS --> BEST{"Better than<br/>the best so far?"}
+    BEST -- "yes" --> KEEP["Keep this pipeline"]
+    BEST -- "no" --> LOOP
+    KEEP --> LOOP
+    LOOP -- "all strengths done" --> OUT[("model.json + pipeline.joblib<br/>with the normalizer settings")]
+```
+
+The third diagram shows the training of a hybrid model.
+
+```mermaid
+flowchart TD
+    IN[/"train and val tweets"/] --> NORM["Normalizer"]
+    NORM --> EMB{"Embedder spec"}
+    EMB -- "hash" --> HE["HashEmbedder: fixed random<br/>64-value vector per token"]
+    EMB -- "hf" --> HF["HFEmbedder: frozen<br/>last hidden states"]
+    HE --> ST["States computed one time"]
+    HF --> ST
+    ST --> HEAD{"Head"}
+    HEAD -- "bilstm" --> BL["BiLSTMHead, 128 units"]
+    HEAD -- "transformer" --> TH["TransformerHead, 2 layers"]
+    BL --> EP["Epoch: Adam 1e-3, batch 64,<br/>clip gradients at 1.0"]
+    TH --> EP
+    EP --> VF["val macro-F1"]
+    VF --> IMP{"Better than<br/>the best epoch?"}
+    IMP -- "yes" --> COPY["Deep copy of the head"]
+    IMP -- "no" --> BAD{"More than 3 bad epochs<br/>or 15 epochs done?"}
+    COPY --> MAX{"15 epochs done?"}
+    MAX -- "no" --> EP
+    BAD -- "no" --> EP
+    BAD -- "yes" --> REST["Restore the best head"]
+    MAX -- "yes" --> REST
+    REST --> OUT[("model.json + head.pt")]
+```
 
 | Model | Features | Settings selected on `val` | Extra |
 |---|---|---|---|
@@ -324,6 +609,47 @@ The fine-tuned model uses AdamW (2e-5, weight decay 0.01), linear decay, 3 epoch
 ---
 
 ## 8. Selection, evaluation and the ablation
+
+The first diagram shows the selection in `train_models` and the test pass in `evaluate_models`.
+
+```mermaid
+flowchart TD
+    TRN["train_models: fit each model,<br/>val macro-F1"] --> OLD{"registry.json exists<br/>with the same fingerprint?"}
+    OLD -- "yes" --> MERGE["Merge the old and the new entries"]
+    OLD -- "no" --> NEWR["New entries only"]
+    MERGE --> BEST["best = highest val macro-F1"]
+    NEWR --> BEST
+    BEST --> REG[("registry.json")]
+    REG --> EV["evaluate_models"]
+    EV --> FP{"Fingerprint of the split<br/>equals the registry?"}
+    FP -- "no" --> ERR[/"ValueError"/]
+    FP -- "yes" --> EACH["For each model: predict_proba on test"]
+    EACH --> SC["scores: macro-F1, 1000 bootstrap CI,<br/>accuracy, ROC-AUC, confusion"]
+    EACH --> SL["slice_scores: source, has_negation,<br/>has_slang, has_emoji_or_emoticon"]
+    EACH --> MC["mcnemar against the best model"]
+    SC --> OUT[/"evaluation.json, evaluation.md"/]
+    SL --> OUT
+    MC --> OUT
+```
+
+The second diagram shows `ablate`. It selects nothing.
+
+```mermaid
+flowchart LR
+    SPLIT[("split.csv")] --> LOOP["For each variant in ABLATIONS"]
+    LOOP --> V1["full"]
+    LOOP --> V2["no-negation-scope"]
+    LOOP --> V3["no-slang"]
+    LOOP --> V4["no-emoji-emoticons"]
+    LOOP --> V5["stopword-removal:<br/>StopwordNormalizer"]
+    V1 --> FIT["TfidfModel fit on train,<br/>strength on val"]
+    V2 --> FIT
+    V3 --> FIT
+    V4 --> FIT
+    V5 --> FIT
+    FIT --> TEST["Predict test, slice_scores"]
+    TEST --> OUT[/"Table: val and test macro-F1,<br/>slices for each variant"/]
+```
 
 | Step | Split | Rule |
 |---|---|---|
@@ -410,6 +736,24 @@ tweetmood normalize "I dont love it :D #NoCap" --negation-scope
 
 `python -m tweetmood` is the same as the `tweetmood` command. `predict` also reads one tweet per line from standard input.
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    SYN["tweetmood synth"] --> RAW[("data/raw/<br/>synthetic_tweets.csv")]
+    DL[/"Downloaded corpora<br/>in data/raw"/] --> PREP
+    RAW -- "unified=PATH" --> PREP["tweetmood prepare"]
+    PREP --> SPL[("data/prepared/<br/>split.csv, manifest.json")]
+    SPL --> TRN["tweetmood train"]
+    TRN --> MOD[("models_out/name/<br/>registry.json")]
+    SPL --> EVL["tweetmood evaluate"]
+    MOD --> EVL
+    EVL --> REP[("models_out/<br/>evaluation.json, .md")]
+    MOD --> PRD["tweetmood predict"]
+    SPL --> ABL["tweetmood ablate"]
+    DEMO["tweetmood demo<br/>all steps in models_out/demo"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -422,6 +766,21 @@ tweetmood normalize "I dont love it :D #NoCap" --negation-scope
 | `TWEETMOOD_HF_OFFLINE` | `hf` embedder, fine-tuned model | `1` loads weights from the local cache only |
 
 tweetmood needs no credentials. Keep any download token out of the repository.
+
+tweetmood reads only the process environment. It does not read a `.env` file.
+
+```mermaid
+flowchart LR
+    PENV[/"Process environment"/] --> LS["load_settings"]
+    LS --> SEED{"TWEETMOOD_SEED<br/>an integer?"}
+    SEED -- "no" --> ERR[/"ValueError,<br/>the command stops"/]
+    SEED -- "yes" --> DEV{"TWEETMOOD_DEVICE<br/>auto, cpu or cuda?"}
+    DEV -- "no" --> ERR
+    DEV -- "yes" --> SET[/"Settings"/]
+    SET --> AUTO{"device auto?"}
+    AUTO -- "yes" --> CU["cuda if torch finds a GPU,<br/>else cpu"]
+    AUTO -- "no" --> FIX["The given device"]
+```
 
 ---
 
